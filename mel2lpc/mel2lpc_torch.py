@@ -90,11 +90,16 @@ class Audio2Mel(torch.nn.Module):
 
 class Mel2LPC(torch.nn.Module):
     def __init__(self, sampling_rate, hop_length, win_length, n_fft=None, 
-                 n_mel_channels=128, mel_fmin=0, mel_fmax=None, repeat=None, f0=80., 
-                 lpc_order=4, clamp=1e-12, mel_base='e'):
+                 n_mel_channels=128, mel_fmin=0, mel_fmax=None, repeat=None, f0=40., 
+                 lpc_order=4, clamp=1e-12, mel_base='e',
+                 lpc_solver='yule_walker',
+                 lpc_reg=1e-4):
         super().__init__()
         n_fft = win_length if n_fft is None else n_fft
         repeat = hop_length if repeat is None else repeat
+
+        self.lpc_solver = lpc_solver
+        self.lpc_reg = lpc_reg
 
         self.mel_base = mel_base
         self.sampling_rate = sampling_rate
@@ -119,40 +124,71 @@ class Mel2LPC(torch.nn.Module):
         inv_mel_basis = torch.pinverse(mel_basis)
         self.register_buffer("inv_mel_basis", inv_mel_basis)  # [F, M]
 
-    def levinson_durbin(self, pAC):
-        """
-        Levinson-Durbin recursion (fully vectorized, supports batch).
+    def solve_levinson_durbin(self, pAC):
+        """levinson durbin's recursion
         Input:
             pAC: autocorrelation [B, n+1, T]
         Returns:
             lpc: LPC coefficients [B, n, T]
         """
         B, n_plus_1, T = pAC.shape
-        n = n_plus_1 - 1  # LPC order
+        n = n_plus_1 - 1
         pLP = torch.zeros(B, n, T, dtype=pAC.dtype, device=pAC.device)
         E = pAC[:, 0, :].clone()  # [B, T]
 
         for i in range(n):
-            # ki = (r[i+1] + sum_{j=0}^{i-1} a_j * r[i-j]) / E
             if i > 0:
-                pAC_slice = pAC[:, 1:i+1, :]                     # [B, i, T]  (r[1]..r[i])
-                pAC_rev = torch.flip(pAC_slice, dims=[1])        # [r[i]..r[1]]
-                sum_term = (pLP[:, :i, :] * pAC_rev).sum(dim=1)  # [B, T]
+                pAC_slice = pAC[:, 1:i+1, :]
+                pAC_rev = torch.flip(pAC_slice, dims=[1])
+                sum_term = (pLP[:, :i, :] * pAC_rev).sum(dim=1)
             else:
                 sum_term = 0.0
 
             ki = (pAC[:, i+1, :] + sum_term) / E
 
-            # Update coefficients
             if i > 0:
                 old = pLP[:, :i, :].clone()
                 pLP[:, :i, :] = old - ki.unsqueeze(1) * torch.flip(old, dims=[1])
             pLP[:, i, :] = -ki
 
-            # Update prediction error
             E = E * (1 - ki * ki).clamp(min=1e-5)
 
         return pLP
+
+    def solve_yule_walker(self, auto_correlation):
+        """
+        Yule-Walker matrix solver
+        Input:
+            auto_correlation: [B, n+1, T]
+        Returns:
+            lpc_coeffs: [B, n, T]
+        """
+        B, n_plus_1, T = auto_correlation.shape
+        n = n_plus_1 - 1
+        if n == 0:
+            return torch.zeros(B, 0, T, dtype=auto_correlation.dtype, device=auto_correlation.device)
+
+        device = auto_correlation.device
+        dtype = auto_correlation.dtype
+
+        ac = auto_correlation.permute(0, 2, 1)  # [B, T, n+1]
+
+        # Construct Toeplitz matrix R: utilize the lag values of the autocorrelation sequence indexed by |i-j|
+        lag = torch.abs(torch.arange(n, device=device)[:, None] - torch.arange(n, device=device)[None, :])  # [n, n]
+        R = ac[:, :, lag]  # [B, T, n, n] Each (i,j) corresponds to r[|i-j|]
+
+        # Diagonal loading (numerical stability)
+        eye = torch.eye(n, device=device, dtype=dtype).unsqueeze(0).unsqueeze(0)  # [1, 1, n, n]
+        R = R + self.lpc_reg * eye
+
+        # Right-end vectors: -r[1], ..., -r[n]
+        rhs = -ac[:, :, 1:n+1]  # [B, T, n]
+
+        # Solve Yule-Walker equation in batch
+        a = torch.linalg.solve(R, rhs)  # [B, T, n]
+
+        a = a.permute(0, 2, 1)
+        return a
 
     def forward(self, mel):
         '''
@@ -186,11 +222,18 @@ class Mel2LPC(torch.nn.Module):
         auto_correlation = auto_correlation[:, :self.lpc_order + 1, :]  # [B, lpc_order+1, T]
         auto_correlation = auto_correlation * self.lag_window
 
-        # 4. Levinson-Durbin recursion
-        lpc_ctrl = self.levinson_durbin(auto_correlation)  # [B, lpc_order, T]
-        lpc_ctrl = -torch.flip(lpc_ctrl, dims=[1])        # make causal
+        # 4. Calculate LPC coefficients based on solver
+        if self.lpc_solver == 'levinson':
+            lpc_coeffs = self.solve_levinson_durbin(auto_correlation)
+        elif self.lpc_solver == 'yule_walker':
+            lpc_coeffs = self.solve_yule_walker(auto_correlation)
+        else:
+            raise ValueError(f"Unsupported LPC solver: {self.lpc_solver}")
 
-        # 5. temporal repeat (upsampling)
+        # 5. post-processing
+        lpc_ctrl = -1 * torch.flip(lpc_coeffs, dims=[1])
+
+        # 6. temporal repeat (upsampling)
         if self.repeat is not None:
             lpc_ctrl = torch.repeat_interleave(lpc_ctrl, self.repeat, dim=-1)
 

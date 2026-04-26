@@ -12,10 +12,13 @@ n_fft = 2048
 num_mels = 128
 hop_length = 512
 win_length = 2048
-lpc_order = 4
+lpc_order = 20
 clip_lpc = True
 mel_fmin = 40
 mel_fmax = 16000
+mel_base='e'
+lpc_solver='yule_walker'
+
 
 wav_data = load_wav(wav_name, sample_rate)
 wav_data = torch.tensor(wav_data).unsqueeze(0).unsqueeze(1)
@@ -30,7 +33,8 @@ a2w = Audio2Mel(
     n_fft=n_fft, 
     n_mel_channels=num_mels, 
     mel_fmin=mel_fmin, 
-    mel_fmax=mel_fmax
+    mel_fmax=mel_fmax, 
+    mel_base=mel_base
     )
 mel = a2w(wav_data)
 
@@ -43,7 +47,9 @@ m2l = Mel2LPC(
     n_mel_channels=num_mels, 
     mel_fmin=mel_fmin, 
     mel_fmax=mel_fmax, 
-    lpc_order=lpc_order
+    lpc_order=lpc_order, 
+    mel_base=mel_base, 
+    lpc_solver=lpc_solver
     )
 LPC_ctrl_mel = m2l(mel.transpose(1, 2))
 
