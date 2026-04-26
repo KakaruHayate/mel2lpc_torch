@@ -4,7 +4,7 @@ import numpy as np
 
 
 from mel2lpc.utils import plot, plot_spec, load_wav, save_wav
-from mel2lpc.mel2lpc_torch import Audio2Mel, Mel2LPC, LPC2Wav, PreEmphasis
+from mel2lpc.mel2lpc_torch import Audio2Mel, Mel2LPC, lpc2wav, PreEmphasis
 
 wav_name = 'wavs/vox_1_0.wav'
 sample_rate = 44100
@@ -12,7 +12,7 @@ n_fft = 2048
 num_mels = 128
 hop_length = 512
 win_length = 2048
-lpc_order = 14
+lpc_order = 4
 clip_lpc = True
 mel_fmin = 40
 mel_fmax = 16000
@@ -21,8 +21,8 @@ wav_data = load_wav(wav_name, sample_rate)
 wav_data = torch.tensor(wav_data).unsqueeze(0).unsqueeze(1)
 
 
-preemph = PreEmphasis(coefficient=0.9375)
-preemph_data = preemph(wav_data)
+# preemph = PreEmphasis(coefficient=0.9375)
+# wav_data = preemph(wav_data)
 a2w = Audio2Mel(
     sampling_rate=sample_rate, 
     hop_length=hop_length, 
@@ -32,7 +32,7 @@ a2w = Audio2Mel(
     mel_fmin=mel_fmin, 
     mel_fmax=mel_fmax
     )
-mel = a2w(preemph_data)
+mel = a2w(wav_data)
 
 
 m2l = Mel2LPC(
@@ -48,7 +48,7 @@ m2l = Mel2LPC(
 LPC_ctrl_mel = m2l(mel.transpose(1, 2))
 
 
-wav_pred_mel = LPC2Wav(LPC_ctrl_mel, wav_data, lpc_order=lpc_order, clip_lpc=clip_lpc)
+wav_pred_mel = lpc2wav(LPC_ctrl_mel, wav_data, lpc_order=lpc_order, clip_lpc=clip_lpc)
 
 
 # Make sure the predicted audio and the original audio have the same shape
